@@ -2,68 +2,315 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Massive Options Scanner (Prototype)</title>
+  <title>Cash-Secured Put Scanner</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    input, button { padding: 8px; margin: 5px 0; width: 100%; }
-    pre { background: #f4f4f4; padding: 10px; white-space: pre-wrap; }
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f7f9fc; }
+    h1 { margin-bottom: 0; }
+    h1 + p { margin-top: 4px; color: #555; }
+    label { display: block; margin-top: 12px; font-weight: bold; }
+    input, textarea, button, select {
+      padding: 8px;
+      margin-top: 4px;
+      width: 100%;
+      box-sizing: border-box;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+      font-size: 14px;
+    }
+    textarea { resize: vertical; min-height: 80px; }
+    button {
+      cursor: pointer;
+      background: #2563eb;
+      color: white;
+      border: none;
+      transition: background 0.2s;
+      margin-top: 16px;
+    }
+    button:hover { background: #1d4ed8; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+    .results { margin-top: 24px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: right;
+      font-size: 13px;
+    }
+    th { background: #e5e7eb; }
+    td.symbol, td.expiration, td.optionSymbol { text-align: left; }
+    .status { margin-top: 16px; font-family: monospace; white-space: pre-wrap; color: #0f172a; }
+    .muted { color: #6b7280; font-size: 13px; }
+    .inline { display: flex; gap: 12px; align-items: center; }
+    .inline input { flex: 1; }
   </style>
 </head>
 <body>
+  <h1>Cash-Secured Put Scanner</h1>
+  <p>Fetches delayed Cboe Global Markets option chains (no API key required) to surface potential cash-secured put candidates. Educational use only.</p>
 
-  <h2>Massive Options Scanner (Prototype)</h2>
+  <label for="symbols">Ticker symbols (comma separated)</label>
+  <textarea id="symbols" placeholder="AAPL, MSFT, AMD, TSLA">AAPL, MSFT, AMD, TSLA</textarea>
 
-  <label>Your Massive API Key:</label>
-  <input id="apiKeyInput" type="text" placeholder="Enter Massive API key" />
+  <div class="grid">
+    <div>
+      <label for="maxDte">Max days to expiration</label>
+      <input id="maxDte" type="number" min="1" value="45" />
+    </div>
+    <div>
+      <label for="minRoi">Min premium/strike (%)</label>
+      <input id="minRoi" type="number" min="0" step="0.1" value="0.5" />
+    </div>
+    <div>
+      <label for="minDiscount">Min discount vs. underlying (%)</label>
+      <input id="minDiscount" type="number" step="0.1" value="0" />
+    </div>
+    <div>
+      <label for="maxStrikesPerExpiry">Max strikes per expiry</label>
+      <input id="maxStrikesPerExpiry" type="number" min="1" value="5" />
+    </div>
+  </div>
 
-  <button onclick="saveKey()">Save API Key</button>
-  <button onclick="testRequest()">Test Request (AAPL)</button>
+  <button onclick="runScan()">Scan for Opportunities</button>
 
-  <h3>Response:</h3>
-  <pre id="output">Click 'Test Request'…</pre>
+  <div class="status" id="status">Ready.</div>
+
+  <div class="results" id="results"></div>
+
+  <p class="muted">Data sourced from Cboe's delayed quote API (typically 15-minute delay). Calculations are approximations—confirm everything with your broker before trading. This is not investment advice.</p>
 
 <script>
-  // Load saved key into input
-  document.getElementById("apiKeyInput").value =
-    localStorage.getItem("massive_api_key") || "";
+  const CBOE_BASE = 'https://cdn.cboe.com/api/global/delayed_quotes/options';
+  const OPTION_PATTERN = /^([A-Z]{1,6})(\d{6})([CP])(\d{8})$/;
 
-  function saveKey() {
-    const key = document.getElementById("apiKeyInput").value.trim();
-    if (!key) {
-      alert("Please enter an API key.");
-      return;
-    }
-    localStorage.setItem("massive_api_key", key);
-    alert("API key saved!");
+  document.addEventListener('DOMContentLoaded', () => {
+    // Clear any legacy keys stored from earlier versions that required APIs.
+    localStorage.removeItem('twelvedata-api-key');
+    localStorage.removeItem('fmp-api-key');
+  });
+
+  function setStatus(msg) {
+    document.getElementById('status').textContent = msg;
   }
 
-  async function testRequest() {
-    const key = document.getElementById("apiKeyInput").value.trim();
-    if (!key) {
-      alert("Please enter your Massive API key first.");
+  async function runScan() {
+    const statusEl = document.getElementById('status');
+    const resultsEl = document.getElementById('results');
+    statusEl.textContent = 'Scanning…';
+    resultsEl.innerHTML = '';
+
+    const symbols = document.getElementById('symbols').value
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+
+    if (!symbols.length) {
+      statusEl.textContent = 'Please provide at least one ticker symbol.';
       return;
     }
 
-    const url = `https://api.massive.xyz/v3/snapshot/options/AAPL`;
+    const maxDte = Number(document.getElementById('maxDte').value) || 45;
+    const minRoi = (Number(document.getElementById('minRoi').value) || 0) / 100;
+    const minDiscount = (Number(document.getElementById('minDiscount').value) || 0) / 100;
+    const maxStrikesPerExpiry = Number(document.getElementById('maxStrikesPerExpiry').value) || 5;
 
     try {
-      const res = await fetch(url, {
-        headers: {
-          "x-api-key": key,
-          "Accept": "application/json"
+      const all = [];
+      for (const symbol of symbols) {
+        setStatus(`Fetching option chain for ${symbol}…`);
+        const chain = await fetchCboeChain(symbol);
+        if (!chain) {
+          setStatus(`No option data returned for ${symbol}.`);
+          continue;
         }
-      });
 
-      const data = await res.json();
-      document.getElementById("output").textContent =
-        JSON.stringify(data, null, 2);
+        const underlying = getUnderlyingPrice(chain);
+        if (!underlying) {
+          setStatus(`Skipping ${symbol}: missing underlying price.`);
+          continue;
+        }
 
+        const grouped = groupPutsByExpiration(chain.options || [], symbol, underlying, {
+          maxDte,
+          minRoi,
+          minDiscount,
+        });
+
+        for (const [, puts] of grouped) {
+          all.push(...puts.slice(0, maxStrikesPerExpiry));
+        }
+      }
+
+      if (!all.length) {
+        statusEl.textContent = 'No matches found with the current filters.';
+        return;
+      }
+
+      const sorted = all.sort((a, b) => b.annualizedRoi - a.annualizedRoi);
+      renderResults(sorted);
+      statusEl.textContent = `Found ${sorted.length} candidates.`;
     } catch (err) {
-      document.getElementById("output").textContent =
-        "ERROR:\n" + err.toString();
+      console.error(err);
+      statusEl.textContent = `Scan failed: ${err.message}`;
     }
   }
-</script>
 
+  async function fetchCboeChain(symbol) {
+    const url = `${CBOE_BASE}/${encodeURIComponent(symbol)}.json`;
+    const res = await fetch(url);
+    if (res.status === 404) {
+      return null;
+    }
+    if (!res.ok) {
+      throw new Error(`${symbol} request failed (${res.status})`);
+    }
+    const json = await res.json();
+    if (!json?.data?.options) {
+      return null;
+    }
+    return json.data;
+  }
+
+  function computeDte(expirationDate, nowMs = Date.now()) {
+    const expiry = new Date(expirationDate + 'T16:00:00Z');
+    if (Number.isNaN(expiry.getTime())) return NaN;
+    return Math.max(0, Math.round((expiry.getTime() - nowMs) / 86400000));
+  }
+
+  function groupPutsByExpiration(options, symbol, underlying, { maxDte, minRoi, minDiscount }) {
+    const now = Date.now();
+    const grouped = new Map();
+
+    for (const opt of options) {
+      const parsed = parseOptionSymbol(opt.option);
+      if (!parsed || parsed.type !== 'P') continue;
+
+      const strike = parsed.strike;
+      if (!strike || !isFinite(strike)) continue;
+
+      const dte = computeDte(parsed.expirationDate, now);
+      if (!Number.isFinite(dte) || dte <= 0 || dte > maxDte) continue;
+
+      const bid = Number(opt.bid) || 0;
+      const ask = Number(opt.ask) || 0;
+      const last = Number(opt.last_trade_price) || 0;
+      const premium = bid > 0 ? bid : ask > 0 ? ask : last;
+      if (!premium) continue;
+
+      const roi = premium / strike;
+      if (roi < minRoi) continue;
+
+      const breakEven = strike - premium;
+      const discount = underlying ? (underlying - breakEven) / underlying : 0;
+      if (discount < minDiscount) continue;
+
+      const annualizedRoi = dte > 0 ? roi * (365 / dte) : 0;
+
+      const iv = Number(opt.iv);
+
+      const entry = {
+        symbol,
+        optionSymbol: opt.option,
+        expirationDate: parsed.expirationDate,
+        dte,
+        strike,
+        premium,
+        roi,
+        annualizedRoi,
+        breakEven,
+        discount,
+        underlying,
+        impliedVolatility: Number.isFinite(iv) && iv > 0 ? iv : null,
+      };
+
+      if (!grouped.has(parsed.expirationDate)) {
+        grouped.set(parsed.expirationDate, []);
+      }
+      grouped.get(parsed.expirationDate).push(entry);
+    }
+
+    for (const entries of grouped.values()) {
+      entries.sort((a, b) => b.annualizedRoi - a.annualizedRoi);
+    }
+
+    return new Map([...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0])));
+  }
+
+  function parseOptionSymbol(optionSymbol) {
+    if (typeof optionSymbol !== 'string') return null;
+    const match = optionSymbol.match(OPTION_PATTERN);
+    if (!match) return null;
+
+    const [, root, yymmdd, type, strikeRaw] = match;
+    const yearTwo = Number(yymmdd.slice(0, 2));
+    const year = yearTwo >= 70 ? 1900 + yearTwo : 2000 + yearTwo;
+    const month = Number(yymmdd.slice(2, 4));
+    const day = Number(yymmdd.slice(4, 6));
+    const strike = Number(strikeRaw) / 1000;
+
+    const expirationDate = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+    return {
+      root: root.trim(),
+      type,
+      strike,
+      expirationDate,
+    };
+  }
+
+  function getUnderlyingPrice(chain) {
+    const candidates = [
+      chain.current_price,
+      chain.close,
+      chain.prev_day_close,
+      chain.ask,
+      chain.bid,
+    ];
+    for (const value of candidates) {
+      const num = Number(value);
+      if (num && isFinite(num)) {
+        return num;
+      }
+    }
+    return null;
+  }
+
+  function renderResults(entries) {
+    const resultsEl = document.getElementById('results');
+    const headers = [
+      'Symbol', 'Option', 'Exp', 'DTE', 'Strike', 'Premium', 'Premium/Strike', 'Annualized ROI', 'Break-even', 'Discount vs Px', 'Price', 'IV'
+    ]
+      .map((h) => `<th>${h}</th>`)
+      .join('');
+
+    const rows = entries
+      .map((entry) => {
+        return `<tr>
+          <td class="symbol">${entry.symbol}</td>
+          <td class="optionSymbol">${entry.optionSymbol}</td>
+          <td class="expiration">${entry.expirationDate}</td>
+          <td>${entry.dte}</td>
+          <td>$${entry.strike.toFixed(2)}</td>
+          <td>$${entry.premium.toFixed(2)}</td>
+          <td>${(entry.roi * 100).toFixed(2)}%</td>
+          <td>${(entry.annualizedRoi * 100).toFixed(1)}%</td>
+          <td>$${entry.breakEven.toFixed(2)}</td>
+          <td>${(entry.discount * 100).toFixed(2)}%</td>
+          <td>$${entry.underlying.toFixed(2)}</td>
+          <td>${entry.impliedVolatility ? (entry.impliedVolatility * 100).toFixed(1) + '%' : '—'}</td>
+        </tr>`;
+      })
+      .join('');
+
+    resultsEl.innerHTML = `<table><thead><tr>${headers}</tr></thead><tbody>${rows}</tbody></table>`;
+  }
+</script>
 </body>
 </html>
